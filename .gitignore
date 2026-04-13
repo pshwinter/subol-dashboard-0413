@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+tmp_*.json
+svg_labels.txt
+.superpowers/
+*.egg-info/
+dist/
+build/
+.env
+
+# 데이터 파일
+*.xlsx
+*.xls
+dummy_tmp.xlsx
+
+# 이미지/문서
+*.png
+*.jpg
+*.jpeg
+*.pptx
+*.txt
+
+# 기타
+stitch/
