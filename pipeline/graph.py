@@ -47,12 +47,14 @@ ROUTER_PROMPT = """\
 
 RAG_SYSTEM = """\
 당신은 철강 제조 공장 수불(입고·사용·재고) 전문 AI입니다.
-포항소·광양소의 수불 데이터를 바탕으로 정확하고 간결하게 답변하세요.
+반드시 제공된 [컨텍스트] 안의 수치만 사용해 답변하세요.
 
 규칙:
-- 제공된 [컨텍스트] 수치만 사용하세요.
-- 컨텍스트에 없으면 구체적으로 질문을 하세요. "데이터 없음"이라 답하세요.
-   예) "원하시는 데이터의 기간은 언제부터 언제까지인가요?", "원하시는 데이터의 사소는 어디인가요?", "원하시는 데이터의 품목은 무엇인가요?", "원하시는 데이터의 공급사는 무엇인가요?", "원하시는 데이터의 등급은 무엇인가요?"
+- [컨텍스트]에 있는 수치·사실만 사용하세요.
+- [컨텍스트]에 없는 내용은 절대 추측하거나 일반 지식으로 보완하지 마세요.
+- 데이터가 없으면 반드시 "해당 데이터가 없습니다"라고만 답하세요.
+  단, 질문이 불명확해 어떤 조건(기간·사소·품목·공급사 등)이 필요한지 알 수 있다면
+  한 가지 추가 질문만 하세요.
 - 수치는 천 단위 콤마 포함 (예: 1,234).
 - 실적과 계획을 혼동하지 마세요.
 - 기간의 기준은 당일 07:00 ~ 익일 06:59가 하루 데이터입니다.
@@ -69,6 +71,7 @@ ANALYSIS_SYSTEM = """\
 
 규칙:
 - 결과를 반드시 result 변수에 저장하세요 (문자열 또는 DataFrame).
+- 데이터에서 해당 값을 찾을 수 없으면 result = "해당 데이터가 없습니다" 로 설정하세요.
 - 수치는 소수점 없이 천 단위 콤마로 포맷하세요.
 - 기간의 기준은 당일 07:00 ~ 익일 06:59가 하루 데이터입니다.
 - import는 pandas, numpy만 허용합니다.
@@ -78,7 +81,10 @@ ANALYSIS_SYSTEM = """\
 ```python
 actual = daily[daily["is_actual"]]
 top = actual.groupby("구매item")["use_qty"].sum().sort_values(ascending=False)
-result = "사용량 상위 품목:\\n" + "\\n".join(f"{i+1}. {k}: {v:,.0f}" for i,(k,v) in enumerate(top.items()))
+if top.empty:
+    result = "해당 데이터가 없습니다"
+else:
+    result = "사용량 상위 품목:\\n" + "\\n".join(f"{i+1}. {k}: {v:,.0f}" for i,(k,v) in enumerate(top.items()))
 ```"""
 
 
@@ -86,6 +92,12 @@ result = "사용량 상위 품목:\\n" + "\\n".join(f"{i+1}. {k}: {v:,.0f}" for 
 
 _ALLOWED_IMPORTS = {"pandas", "numpy", "pd", "np"}
 _FORBIDDEN = ["import os", "import sys", "open(", "exec(", "eval(", "__"]
+
+# 안전하게 허용할 파이썬 내장 함수 목록
+_SAFE_BUILTINS = {k: __builtins__[k] if isinstance(__builtins__, dict) else getattr(__builtins__, k)
+                  for k in ["len", "range", "int", "str", "float", "bool", "sum", "sorted",
+                             "enumerate", "zip", "min", "max", "abs", "round", "list", "dict",
+                             "tuple", "set", "isinstance", "print", "type", "any", "all"]}
 
 
 def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame, gubun_summary: pd.DataFrame | None = None) -> str:
@@ -107,7 +119,7 @@ def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame, gubun_
         "result": "결과 없음",
     }
     try:
-        exec(clean_code, {"__builtins__": {}}, local_vars)  # noqa: S102
+        exec(clean_code, {"__builtins__": _SAFE_BUILTINS}, local_vars)  # noqa: S102
         result = local_vars.get("result", "result 변수가 정의되지 않았습니다.")
         if isinstance(result, pd.DataFrame):
             return result.to_string(index=False)
@@ -135,15 +147,16 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, api_key=api_key)
 
     # ── 노드 1: 라우터 (LLM 조건부 분기) ────────────────────────
-    def router_node(state: ChatState) -> ChatState:
+    def router_node(state: ChatState) -> dict:
         last_human = _get_last_human_message(state)
         prompt = ROUTER_PROMPT.format(query=last_human)
         resp = llm.invoke([SystemMessage(content=prompt)])
-        route = "analysis" if "analysis" in resp.content.lower() else "rag"
-        return {**state, "route": route}
+        # "[analysis]"를 명시적으로 체크해 오탐 방지
+        route = "analysis" if "[analysis]" in resp.content.lower() else "rag"
+        return {"route": route}
 
     # ── 노드 2: RAG 노드 ─────────────────────────────────────────
-    def rag_node(state: ChatState) -> ChatState:
+    def rag_node(state: ChatState) -> dict:
         last_human = _get_last_human_message(state)
         context = retriever.retrieve(last_human)
 
@@ -155,14 +168,13 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
         ]
         resp = llm.invoke(messages)
         return {
-            **state,
             "context": context,
             "answer": resp.content,
             "messages": [AIMessage(content=resp.content)],
         }
 
     # ── 노드 3: 데이터 분석 노드 (CSV 에이전트 방식) ─────────────
-    def analysis_node(state: ChatState) -> ChatState:
+    def analysis_node(state: ChatState) -> dict:
         last_human = _get_last_human_message(state)
         # LLM이 pandas 코드 생성
         code_prompt = [
@@ -175,9 +187,29 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
         # 코드 실행
         exec_result = _safe_exec(generated_code, daily, supplier_df, gubun_summary)
 
-        # 결과를 자연어로 정리
+        # 실행 실패 또는 데이터 없음 → 환각 없이 즉시 반환
+        _NO_DATA_SIGNALS = (
+            "코드 실행 오류",
+            "결과 없음",
+            "허용되지 않는",
+            "해당 데이터가 없습니다",
+            "result 변수가 정의되지 않았습니다",
+        )
+        if any(sig in exec_result for sig in _NO_DATA_SIGNALS):
+            answer = "해당 데이터가 없습니다."
+            return {
+                "context": [f"[생성 코드]\n{generated_code}", f"[실행 결과]\n{exec_result}"],
+                "answer": answer,
+                "messages": [AIMessage(content=answer)],
+            }
+
+        # 실제 데이터가 있을 때만 자연어 정리
         summary_prompt = [
-            SystemMessage(content="분석 결과를 한국어로 간결하게 정리하세요. 수치는 천 단위 콤마 포함."),
+            SystemMessage(content=(
+                "분석 결과를 한국어로 간결하게 정리하세요. 수치는 천 단위 콤마 포함.\n"
+                "절대로 분석 결과에 없는 수치를 만들어내거나 추측하지 마세요.\n"
+                "분석 결과에 있는 내용만 그대로 요약하세요."
+            )),
             HumanMessage(content=f"원래 질문: {last_human}\n\n분석 결과:\n{exec_result}"),
         ]
         summary = llm.invoke(summary_prompt)
@@ -186,7 +218,6 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
         detail = f"\n\n<분석 상세>\n{exec_result}"
 
         return {
-            **state,
             "context": [f"[생성 코드]\n{generated_code}", f"[실행 결과]\n{exec_result}"],
             "answer": answer + detail,
             "messages": [AIMessage(content=answer)],
