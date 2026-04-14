@@ -35,15 +35,16 @@ class ChatState(TypedDict):
 ROUTER_PROMPT = """\
 사용자 질문을 아래 두 유형 중 하나로 분류하세요.
 
-[rag] - 전체 기간 요약 조회: 특정 날짜 없이 현황·합계·순위 조회
-  예) "포항소 전체 재고는?", "가장 많이 납품한 공급사는?", "ADS01 전체 입고량"
+[rag] - 전체 기간 요약만 해당: 날짜·월 조건 없이 전체 현황·순위만 조회
+  예) "포항소 전체 재고는?", "가장 많이 납품한 공급사는?"
 
-[analysis] - 아래 중 하나에 해당하면 반드시 [analysis]
-  1. 특정 날짜(월·일)가 명시된 재고/입고/사용 조회
-     예) "4월 13일 ADS01 재고", "3월 포항소 입고량", "2026-04-10 재고"
-  2. 날짜+사소+품목 조합 필터가 필요한 조회
-  3. 집계, 비율, 추이, 달성률, 상관관계 등 계산
-  예) "사용량이 가장 많은 달은?", "계획 대비 실적 달성률", "품목별 재고 비율"
+[analysis] - 아래 중 하나라도 해당하면 반드시 [analysis]
+  1. 특정 월(1월~12월) 또는 날짜가 질문에 포함된 경우
+     예) "3월 입고량", "4월 13일 재고", "1분기 사용량"
+  2. 사소(포항소/광양소) + 품목 + 날짜/월 조건이 2개 이상 조합된 경우
+     예) "포항소 3월 ADS01 입고량", "광양소 ADS01 4월 재고"
+  3. 합계·평균·비율·추이·달성률 등 집계 계산이 필요한 경우
+     예) "사용량이 가장 많은 달", "계획 대비 달성률", "품목별 재고 비율"
 
 질문: {query}
 
@@ -96,6 +97,19 @@ if row.empty:
     result = "해당 데이터가 없습니다"
 else:
     result = f"포항소 ADS01 {target_date} 재고: {row['inv'].iloc[-1]:,.0f}"
+```
+
+특정 월의 사소+품목 입고량 합계 예시 (포항소 3월 ADS01 입고량):
+```python
+actual = daily[daily["is_actual"]]
+year = pd.to_datetime(actual["date"].max()).year
+mask = (actual["사소구분"] == "포항소") & (actual["구매item"] == "ADS01") & (actual["date"].str.startswith(f"{year}-03"))
+filtered = actual[mask]
+if filtered.empty:
+    result = "해당 데이터가 없습니다"
+else:
+    total = filtered["recv_qty"].sum()
+    result = f"포항소 ADS01 {year}년 3월 입고량: {total:,.0f}"
 ```
 
 집계 조회 예시 (사용량 상위 품목):
