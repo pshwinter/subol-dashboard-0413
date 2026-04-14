@@ -1,6 +1,7 @@
 # dashboard/app.py
 import io
 import re
+import threading
 import calendar
 import datetime
 import smtplib
@@ -23,8 +24,37 @@ from report.exporter import export_workbook_bytes
 from pipeline.transform import SITE_MAP, standardize_expected_df
 from pipeline.gubun_signal import build_gubun_signal, _count_working_days
 
+from price_monitor.crawler import crawl_all, SCRAP_GRADES
+from price_monitor.storage import (
+    add_manual_record, load_prices, save_records,
+    load_pending_review, save_pending_review,
+    update_review_status, approve_review_record,
+)
 
-_LOAD_VERSION = "v11"   # 코드 변경 시 올려서 캐시 강제 무효화
+# ─── 구매가격 모니터링 — 공유 상태 ───────────────────────────
+_pm_state: dict = {"last_update": None, "last_added": 0}
+_pm_lock = threading.Lock()
+
+
+def _run_crawl() -> None:
+    sd_records, gap_records = crawl_all()
+    count = save_records(sd_records)
+    save_pending_review(gap_records)
+    with _pm_lock:
+        _pm_state["last_update"] = datetime.datetime.now()
+        _pm_state["last_added"] = count
+
+
+@st.cache_resource
+def _init_pm_scheduler():
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler(timezone="Asia/Seoul")
+    scheduler.add_job(_run_crawl, trigger="cron", hour="1,13", minute=0, id="pm_crawl_job")
+    scheduler.start()
+    return scheduler
+
+
+_LOAD_VERSION = "v12"   # 코드 변경 시 올려서 캐시 강제 무효화
 
 # 숫자·증감% 색상 강조 패턴 (모듈 레벨 컴파일 — _colorize() 공용)
 _COLORIZE_PATTERN = re.compile(r'(\+[\d.]+%)|(-[\d.]+%)|([\d,]+(?:\.\d+)?)')
@@ -925,10 +955,8 @@ def _render_signal_badge(signal_data: dict, threshold: float) -> None:
                 )
 
 
-def render():
-    st.set_page_config(page_title="철스크랩 수불현황", layout="wide")
-    _inject_css()
-    st.title("철스크랩 수불현황")
+def _render_subol_tab():
+    """철스크랩 수불현황 탭 본체."""
 
     # ── 사이드바 ────────────────────────────────────────────────
     st.sidebar.header("데이터 업로드")
@@ -937,7 +965,7 @@ def render():
 
     if not data_file or not ref_file:
         st.info("왼쪽 사이드바에서 수불 데이터와 기준정보 파일을 업로드해 주세요.")
-        st.stop()
+        return
 
     try:
         daily, supplier_df, receipt_raw, supplier_gubuns, gubun_grades, grade_lookup, exp_recv_all, exp_use_all, region_ref = load_all(
@@ -948,7 +976,7 @@ def render():
         st.error(f"파일 로딩 오류: {e}")
         with st.expander("상세 오류 (디버그용)"):
             st.code(traceback.format_exc())
-        st.stop()
+        return
 
     # ── 데이터 다운로드 placeholder (선택월 확정 후 채워짐) ─────────
     st.sidebar.divider()
@@ -1608,6 +1636,401 @@ def render():
                 st.sidebar.success("메일이 발송되었습니다.")
             except Exception as _mail_ex:
                 st.sidebar.error(f"메일 발송 실패: {_mail_ex}")
+
+
+def _render_price_monitoring() -> None:
+    """구매가격 모니터링 탭 본체."""
+    try:
+        _init_pm_scheduler()
+    except Exception:
+        pass  # APScheduler 미설치 시 자동갱신 비활성화
+
+    # ─── 상태 / 갱신 버튼 ────────────────────────────────────
+    pm_col_status, pm_col_btn = st.columns([4, 1])
+    with pm_col_status:
+        with _pm_lock:
+            _last = _pm_state["last_update"]
+            _added = _pm_state["last_added"]
+        if _last:
+            st.caption(f"마지막 업데이트: {_last.strftime('%Y-%m-%d %H:%M:%S')} | 신규 {_added}건")
+        else:
+            st.caption("크롤링 대기 중...")
+    with pm_col_btn:
+        if st.button("지금 갱신", use_container_width=True, key="pm_refresh"):
+            with st.spinner("크롤링 중..."):
+                _run_crawl()
+            st.rerun()
+
+    st.divider()
+
+    # ─── 데이터 로드 ─────────────────────────────────────────
+    pm_df = load_prices()
+
+    if pm_df.empty:
+        st.info("데이터가 없습니다. '지금 갱신' 버튼을 눌러 크롤링을 시작하세요.")
+        return
+
+    pm_df["date"] = pd.to_datetime(pm_df["date"], errors="coerce")
+
+    def _pm_infer_grade(row) -> str:
+        g = str(row.get("grade", "")).strip()
+        if g:
+            return g
+        title = str(row.get("title", ""))
+        for grade, keywords in SCRAP_GRADES.items():
+            if any(kw in title for kw in keywords):
+                return grade
+        return ""
+
+    pm_df["grade"] = pm_df.apply(_pm_infer_grade, axis=1)
+    pm_df["grade"] = pm_df["grade"].apply(
+        lambda g: "전등급" if not str(g).strip() or str(g) == "nan" else g
+    )
+    if "category" not in pm_df.columns:
+        pm_df["category"] = "국내"
+
+    _PM_GRADE_OPTIONS = ["전체", "전등급"] + list(SCRAP_GRADES.keys())
+
+    # ─── 필터 (인라인) ───────────────────────────────────────
+    with st.expander("필터", expanded=True):
+        _f1, _f2, _f3, _f4 = st.columns([1, 1, 1, 1])
+        with _f1:
+            pm_category = st.radio("구분", ["국내", "수입", "전체"], horizontal=True, key="pm_category")
+        with _f2:
+            _pm_src_opts = ["전체"] + sorted(pm_df["source"].unique().tolist())
+            pm_source = st.selectbox("신문사", _pm_src_opts, key="pm_source")
+        with _f3:
+            _pm_cat_df = pm_df if pm_category == "전체" else pm_df[pm_df["category"] == pm_category]
+            _pm_company_opts = ["전체"] + sorted(
+                _pm_cat_df["company"].dropna().replace("", pd.NA).dropna().unique().tolist()
+            )
+            pm_company = st.selectbox("제강사", _pm_company_opts, key="pm_company")
+        with _f4:
+            pm_grade = st.selectbox("품종", _PM_GRADE_OPTIONS, key="pm_grade")
+
+        _f5, _f6 = st.columns([1, 3])
+        with _f5:
+            pm_all_period = st.checkbox("전체 기간", value=False, key="pm_all_period")
+        with _f6:
+            pm_days = st.slider("최근 N일", min_value=7, max_value=365, value=30,
+                                disabled=pm_all_period, key="pm_days")
+
+    def _pm_apply_filters(data: pd.DataFrame, *, include_period: bool = True) -> pd.DataFrame:
+        result = data.copy()
+        if pm_category != "전체":
+            result = result[result["category"] == pm_category]
+        if pm_source != "전체":
+            result = result[result["source"] == pm_source]
+        if pm_company != "전체":
+            result = result[result["company"] == pm_company]
+        if pm_grade != "전체":
+            result = result[result["grade"] == pm_grade]
+        if include_period and not pm_all_period:
+            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=pm_days)
+            result = result[result["date"] >= cutoff]
+        return result.sort_values("date", ascending=False)
+
+    def _pm_fmt_change(val):
+        try:
+            v = float(val)
+            if v > 0:
+                return f"▲ +{int(v):,}"
+            elif v < 0:
+                return f"▼ {int(v):,}"
+            return "── 0"
+        except (TypeError, ValueError):
+            return "-"
+
+    # ─── 탭 구성 ─────────────────────────────────────────────
+    _pm_tab1, _pm_tab2, _pm_tab3 = st.tabs(["📋 필터 결과", "📂 전체 데이터", "📈 가격 추이 차트"])
+
+    _PM_COL_CFG = {
+        "date":     st.column_config.TextColumn("날짜", width="small"),
+        "category": st.column_config.TextColumn("구분", width="small"),
+        "source":   st.column_config.TextColumn("신문사", width="small"),
+        "company":  st.column_config.TextColumn("제강사", width="small"),
+        "grade":    st.column_config.TextColumn("품종", width="small"),
+        "action":   st.column_config.TextColumn("방향", width="small"),
+        "변동폭":   st.column_config.TextColumn("변동폭(원/톤)", width="small"),
+        "title":    st.column_config.TextColumn("기사 제목"),
+        "url":      st.column_config.LinkColumn("원문", width="small"),
+    }
+
+    # ── 탭1: 필터 결과 ───────────────────────────────────────
+    with _pm_tab1:
+        _pm_filtered = _pm_apply_filters(pm_df)
+        st.subheader(f"가격 동향 기사 ({len(_pm_filtered)}건)")
+        if _pm_filtered.empty:
+            st.info("해당 조건의 데이터가 없습니다.")
+        else:
+            _disp = _pm_filtered[["date", "source", "category", "company", "grade", "action", "change", "title", "url"]].copy()
+            _disp["date"] = _disp["date"].dt.strftime("%Y-%m-%d")
+            _disp["변동폭"] = _disp["change"].apply(_pm_fmt_change)
+            st.dataframe(
+                _disp[["date", "category", "source", "company", "grade", "action", "변동폭", "title", "url"]],
+                column_config=_PM_COL_CFG,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ── 탭2: 전체 데이터 ────────────────────────────────────
+    _PM_ALL_CFG = {
+        "date":    st.column_config.TextColumn("날짜", width="small"),
+        "source":  st.column_config.TextColumn("신문사", width="small"),
+        "company": st.column_config.TextColumn("제강사", width="small"),
+        "grade":   st.column_config.TextColumn("품종", width="small"),
+        "action":  st.column_config.TextColumn("방향", width="small"),
+        "변동폭":  st.column_config.TextColumn("변동폭(원/톤)", width="small"),
+        "title":   st.column_config.TextColumn("기사 제목"),
+        "url":     st.column_config.LinkColumn("원문", width="small"),
+    }
+
+    def _pm_render_table(data: pd.DataFrame) -> None:
+        if data.empty:
+            st.info("데이터가 없습니다.")
+            return
+        d = data[["date", "source", "company", "grade", "action", "change", "title", "url"]].copy()
+        d["date"] = d["date"].dt.strftime("%Y-%m-%d")
+        d["변동폭"] = d["change"].apply(_pm_fmt_change)
+        st.dataframe(
+            d[["date", "source", "company", "grade", "action", "변동폭", "title", "url"]],
+            column_config=_PM_ALL_CFG,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with _pm_tab2:
+        _review_df = load_pending_review()
+        _review_df["date"] = pd.to_datetime(_review_df["date"], errors="coerce")
+        _waiting  = _review_df[_review_df["review_status"] == "대기"].reset_index(drop=True)
+        _rejected = _review_df[_review_df["review_status"] == "미반영"].reset_index(drop=True)
+
+        if not _waiting.empty:
+            st.subheader(f"⚠️ 스크랩워치 검토 대기 ({len(_waiting)}건)")
+            st.caption("스틸데일리에 없는 스크랩워치 가격변동입니다. 반영 여부를 확인해 주세요.")
+            _GRADE_OPTS = list(SCRAP_GRADES.keys()) + ["기타", ""]
+            for i, row in _waiting.iterrows():
+                _date_str = row["date"].strftime("%Y-%m-%d") if pd.notna(row["date"]) else "-"
+                _key = f"pm_{i}_{row.get('url','')[:30]}_{row.get('grade','')}"
+                with st.container():
+                    rc = st.columns([1.2, 1.4, 0.9, 0.9, 1.0, 0.7, 0.7, 0.7])
+                    rc[0].write(f"**{_date_str}**")
+                    rc[1].write(row.get("company", ""))
+                    rc[2].write(row.get("grade", ""))
+                    rc[3].write(row.get("action", ""))
+                    rc[4].write(_pm_fmt_change(row.get("change")))
+                    if rc[5].button("반영", key=f"pm_ap_{_key}"):
+                        approve_review_record(row.to_dict())
+                        st.rerun()
+                    if rc[6].button("미반영", key=f"pm_rj_{_key}"):
+                        update_review_status(str(row.get("url", "")), str(row.get("grade") or ""), "미반영")
+                        st.rerun()
+                    if rc[7].button("수정", key=f"pm_ed_{_key}"):
+                        st.session_state[f"pm_edit_{_key}"] = not st.session_state.get(f"pm_edit_{_key}", False)
+                if st.session_state.get(f"pm_edit_{_key}"):
+                    with st.form(key=f"pm_form_{_key}"):
+                        fe1, fe2, fe3, fe4, fe5 = st.columns([1.2, 1.5, 1, 1, 1])
+                        e_date    = fe1.date_input("날짜", value=row["date"].date() if pd.notna(row["date"]) else datetime.date.today())
+                        e_company = fe2.text_input("제강사", value=str(row.get("company") or ""))
+                        cur_grade = str(row.get("grade") or "")
+                        g_idx     = _GRADE_OPTS.index(cur_grade) if cur_grade in _GRADE_OPTS else 0
+                        e_grade   = fe3.selectbox("품종", _GRADE_OPTS, index=g_idx)
+                        e_change  = fe4.number_input("변동(원/톤)", value=int(row.get("change") or 0), step=1000)
+                        e_source  = fe5.text_input("출처", value=str(row.get("source") or "스크랩워치"))
+                        if st.form_submit_button("저장 후 반영"):
+                            modified = row.to_dict()
+                            modified.update({
+                                "date":    str(e_date),
+                                "company": e_company,
+                                "grade":   e_grade,
+                                "change":  e_change,
+                                "action":  "인상" if e_change > 0 else ("인하" if e_change < 0 else "보합"),
+                                "source":  e_source,
+                            })
+                            approve_review_record(modified)
+                            st.session_state[f"pm_edit_{_key}"] = False
+                            st.rerun()
+            st.divider()
+
+        if not _rejected.empty:
+            with st.expander(f"미반영 처리 항목 ({len(_rejected)}건)"):
+                for i, row in _rejected.iterrows():
+                    _date_str = row["date"].strftime("%Y-%m-%d") if pd.notna(row["date"]) else "-"
+                    _key = f"pm_rej_{i}_{row.get('url','')[:20]}"
+                    rc = st.columns([1.2, 1.4, 0.9, 0.9, 1.0, 1])
+                    rc[0].write(_date_str)
+                    rc[1].write(row.get("company", ""))
+                    rc[2].write(row.get("grade", ""))
+                    rc[3].write(row.get("action", ""))
+                    rc[4].write(_pm_fmt_change(row.get("change")))
+                    if rc[5].button("다시 검토", key=f"pm_re_{_key}"):
+                        update_review_status(str(row.get("url", "")), str(row.get("grade") or ""), "대기")
+                        st.rerun()
+            st.divider()
+
+        _all_data = _pm_apply_filters(pm_df, include_period=False)
+        _domestic = _all_data[_all_data["category"] == "국내"]
+        _imported = _all_data[_all_data["category"] == "수입"]
+        st.subheader(f"국내 ({len(_domestic)}건)")
+        _pm_render_table(_domestic)
+        st.subheader(f"수입 ({len(_imported)}건)")
+        _pm_render_table(_imported)
+
+    # ── 탭3: 가격 추이 차트 ─────────────────────────────────
+    with _pm_tab3:
+        import plotly.express as px
+        st.subheader("제강사별 누적 가격 변동 추이")
+
+        def _expand_all_grades(cdf: pd.DataFrame) -> pd.DataFrame:
+            individual_grades = list(SCRAP_GRADES.keys())
+            mask = cdf["grade"] == "전등급"
+            normal, universal = cdf[~mask], cdf[mask]
+            if universal.empty:
+                return cdf
+            rows = [
+                {**row.to_dict(), "grade": g}
+                for _, row in universal.iterrows()
+                for g in individual_grades
+            ]
+            return pd.concat([normal, pd.DataFrame(rows)], ignore_index=True)
+
+        _chart_category = st.radio("구분", ["국내", "수입"], horizontal=True, key="pm_chart_category")
+        _chart_base = pm_df[pm_df["category"] == _chart_category]
+        _company_list = sorted(
+            _chart_base["company"].dropna().replace("", pd.NA).dropna().unique().tolist()
+        )
+        if not _company_list:
+            st.info("해당 구분의 제강사 데이터가 없습니다.")
+            return
+
+        _grade_options = list(SCRAP_GRADES.keys())
+        cc1, cc2, cc3 = st.columns([3, 2, 2])
+        with cc1:
+            chart_companies = st.multiselect("제강사", _company_list, default=_company_list, key="pm_chart_companies")
+        with cc2:
+            chart_grades = st.multiselect("품종", _grade_options, default=_grade_options, key="pm_chart_grades")
+        with cc3:
+            _default_start = (datetime.datetime.now() - datetime.timedelta(days=180)).date()
+            chart_start = st.date_input("기준일자 (이 날부터 누적 변동)", value=_default_start, key="pm_chart_start")
+
+        if not chart_companies or not chart_grades:
+            st.info("제강사와 품종을 하나 이상 선택하세요.")
+            return
+
+        _base_mask = (
+            (pm_df["source"] == "스틸데일리") &
+            (pm_df["category"] == _chart_category) &
+            pm_df["change"].notna() &
+            (pm_df["date"] >= pd.Timestamp(chart_start)) &
+            pm_df["company"].isin(chart_companies)
+        )
+        chart_df = pm_df[_base_mask].copy()
+        chart_df = _expand_all_grades(chart_df)
+        chart_df = chart_df[chart_df["grade"].isin(chart_grades)]
+        chart_df = chart_df.sort_values("date")
+
+        if chart_df.empty:
+            st.info("선택 조건에 해당하는 변동폭 데이터가 없습니다.")
+            return
+
+        multi_company = len(chart_companies) > 1
+        multi_grade   = len(chart_grades) > 1
+        if multi_company and multi_grade:
+            chart_df["_group"] = chart_df["company"] + " · " + chart_df["grade"]
+            chart_df["누적변동"] = chart_df.groupby("_group")["change"].cumsum()
+            color_col, color_label = "_group", "제강사·품종"
+        elif multi_company:
+            chart_df["누적변동"] = chart_df.groupby("company")["change"].cumsum()
+            color_col, color_label = "company", "제강사"
+        else:
+            chart_df["누적변동"] = chart_df.groupby("grade")["change"].cumsum()
+            color_col, color_label = "grade", "품종"
+
+        chart_df["누적변동_kg"] = chart_df["누적변동"] / 1000
+
+        sorted_dates = sorted(chart_df["date"].unique())
+        tick_vals, tick_texts = [], []
+        seen_months: set = set()
+        prev_year = None
+        for dt in sorted_dates:
+            ts = pd.Timestamp(dt)
+            month_key = (ts.year, ts.month)
+            if month_key not in seen_months:
+                seen_months.add(month_key)
+                label = ts.strftime("%y.%m월") if (prev_year is None or ts.year != prev_year) else ts.strftime("%m월")
+                tick_vals.append(dt)
+                tick_texts.append(label)
+                prev_year = ts.year
+
+        company_title = ", ".join(chart_companies) if len(chart_companies) <= 3 else f"{len(chart_companies)}개 제강사"
+        grade_title   = ", ".join(chart_grades)   if len(chart_grades)   <= 3 else f"{len(chart_grades)}개 품종"
+
+        fig = px.line(
+            chart_df,
+            x="date", y="누적변동_kg", color=color_col, markers=True,
+            title=f"{company_title} · {grade_title} — 기준일({chart_start}) 대비 누적 가격 변동(원/kg)",
+            labels={"date": "날짜", "누적변동_kg": "누적 변동(원/kg)", color_col: color_label},
+        )
+        fig.update_layout(hovermode="x unified")
+        fig.update_xaxes(tickvals=tick_vals, ticktext=tick_texts)
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("차트 기간 기사 목록"):
+            _detail_cols = ["date", "company", "grade", "action", "change", "title", "url"]
+            detail = chart_df[_detail_cols].copy()
+            detail["date"] = detail["date"].dt.strftime("%Y-%m-%d")
+            detail["변동폭"] = detail["change"].apply(_pm_fmt_change)
+            _cfg = {
+                "date":    st.column_config.TextColumn("날짜", width="small"),
+                "company": st.column_config.TextColumn("제강사", width="small"),
+                "grade":   st.column_config.TextColumn("품종", width="small"),
+                "action":  st.column_config.TextColumn("방향", width="small"),
+                "변동폭":  st.column_config.TextColumn("변동폭(원/톤)", width="small"),
+                "title":   st.column_config.TextColumn("기사 제목"),
+                "url":     st.column_config.LinkColumn("원문", width="small"),
+            }
+            show_cols = [c for c in _detail_cols if c != "change"] + ["변동폭"]
+            st.dataframe(detail[show_cols], column_config=_cfg, use_container_width=True, hide_index=True)
+
+    # ─── 수동 가격 입력 ──────────────────────────────────────
+    st.divider()
+    with st.expander("수동 가격 입력 (유료기사 내용 직접 입력)"):
+        with st.form("pm_manual_entry_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                m_date    = st.date_input("날짜", key="pm_m_date")
+                m_company = st.text_input("제강사명", placeholder="예: 현대제철", key="pm_m_company")
+            with c2:
+                m_grade = st.selectbox("품종", list(SCRAP_GRADES.keys()) + ["기타"], key="pm_m_grade")
+                m_price = st.number_input("구매가격 (원/톤)", min_value=0, step=1000, value=0, key="pm_m_price")
+            with c3:
+                m_change = st.number_input("전기 대비 변동 (원/톤, 음수=인하)", step=1000, value=0, key="pm_m_change")
+                m_source = st.text_input("출처", value="수동입력", key="pm_m_source")
+            if st.form_submit_button("저장", use_container_width=True):
+                if not m_company:
+                    st.error("제강사명을 입력하세요.")
+                else:
+                    add_manual_record(
+                        date=str(m_date), company=m_company, grade=m_grade,
+                        price=int(m_price), change=int(m_change), source=m_source,
+                    )
+                    st.success(f"{m_company} {m_grade} 가격 저장 완료")
+                    st.rerun()
+
+
+def render():
+    st.set_page_config(page_title="철스크랩 구매 대시보드", layout="wide")
+    _inject_css()
+    st.title("철스크랩 구매 대시보드")
+
+    _tab_subol, _tab_price = st.tabs(["철스크랩 수불현황", "구매가격 모니터링"])
+
+    with _tab_subol:
+        _render_subol_tab()
+
+    with _tab_price:
+        _render_price_monitoring()
 
 
 render()
