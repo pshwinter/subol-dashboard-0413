@@ -478,6 +478,7 @@ def make_comparison_bar(
     label_a: str = "A기간",
     label_b: str = "B기간",
     group_col: str = "구분",
+    ylabel: str = "입고량",
 ) -> go.Figure:
     """A기간 vs B기간 나란히 비교 막대 차트.
 
@@ -500,7 +501,7 @@ def make_comparison_bar(
     for a, b in zip(vals_a, vals_b):
         if b > 0:
             pct = (a - b) / b * 100
-            pct_texts.append(f"{'+' if pct >= 0 else ''}{pct:.0f}%")
+            pct_texts.append(f"+{pct:.0f}%" if pct >= 0 else f"△{abs(pct):.0f}%")
         else:
             pct_texts.append("")
 
@@ -526,7 +527,7 @@ def make_comparison_bar(
     fig.update_layout(
         barmode="group",
         xaxis_title=group_col,
-        yaxis=dict(title="입고량", tickformat=",.0f", gridcolor="#E2E8F0"),
+        yaxis=dict(title=ylabel, tickformat=",.1f", gridcolor="#E2E8F0"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified",
         plot_bgcolor="#FAFAFA",
@@ -566,7 +567,7 @@ def make_gubun_signal_bar(
     pct_vals  = [v["pct"] for _, v in items]
 
     pct_texts = [
-        f"{'+' if p >= 0 else ''}{p:.1f}%"
+        f"+{p:.1f}%" if p >= 0 else f"△{abs(p):.1f}%"
         for p in pct_vals
     ]
 

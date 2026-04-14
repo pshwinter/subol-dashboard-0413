@@ -17,11 +17,11 @@ from pipeline.metrics import bucket_metrics
 from pipeline.supplier import build_supplier_summary
 from pipeline.rag import build_chunks, RAGRetriever
 from pipeline.graph import build_graph
-from dashboard.charts import make_monthly_chart, make_receipt_detail_bar, make_multi_month_bar, make_comparison_bar, make_gubun_signal_bar
+from dashboard.charts import make_monthly_chart, make_receipt_detail_bar, make_multi_month_bar, make_comparison_bar
 from report.exporter import export_workbook_bytes
 
 from pipeline.transform import SITE_MAP, standardize_expected_df
-from pipeline.gubun_signal import build_gubun_signal
+from pipeline.gubun_signal import build_gubun_signal, _count_working_days
 
 
 _LOAD_VERSION = "v11"   # 코드 변경 시 올려서 캐시 강제 무효화
@@ -226,7 +226,8 @@ def _colorize(text: str) -> str:
         if m.group(1):
             buf.append(f'<span style="color:{_POS_COLOR};font-weight:700">{m.group(1)}</span>')
         elif m.group(2):
-            buf.append(f'<span style="color:{_NEG_COLOR};font-weight:700">{m.group(2)}</span>')
+            _neg_display = "△" + m.group(2)[1:]   # '-5.3%' → '△5.3%'
+            buf.append(f'<span style="color:{_NEG_COLOR};font-weight:700">{_neg_display}</span>')
         else:
             buf.append(f'<span style="color:{_NUM_COLOR};font-weight:700">{m.group(3)}</span>')
         i = m.end()
@@ -864,96 +865,39 @@ def _send_gmail(
         smtp.sendmail(sender, recipients, msg.as_string())
 
 
-def _render_gubun_signal_section(receipt: pd.DataFrame, api_key: str | None = None) -> None:
-    """구분별 가격정책 신호 섹션 렌더링."""
-    st.header("구분별 가격정책 신호")
-    st.caption("구분(유통/MOU/전용야드)별 입고량 변화 패턴으로 가격 조정 필요 여부를 감지합니다.")
+_SIGNAL_LEVEL_STYLE = {
+    "red":    ("🔴", "#fef2f2", "#b91c1c"),
+    "yellow": ("🟡", "#fffbeb", "#92400e"),
+    "green":  ("🟢", "#f0fdf4", "#166534"),
+    "gray":   ("⚪", "#f8fafc", "#475569"),
+}
 
-    sg_c1, sg_c2, sg_c3 = st.columns([1, 1, 1])
-    with sg_c1:
-        sg_site_opts = (
-            ["전체"] + sorted(receipt["사소구분"].dropna().unique().tolist())
-            if "사소구분" in receipt.columns else ["전체"]
-        )
-        sg_site = st.selectbox("사소구분", sg_site_opts, key="sg_site")
-    with sg_c2:
-        sg_compare = st.radio("비교 기준", ["전월 대비", "전주 대비", "직접 설정"], horizontal=True, key="sg_compare")
-    with sg_c3:
-        sg_threshold = st.slider("임계값 (%)", min_value=1, max_value=20, value=5, key="sg_threshold")
 
-    # 직접 설정 모드: 날짜 범위 입력
-    sg_cur_period = None
-    sg_prev_period = None
-    if sg_compare == "직접 설정":
-        _min_date = receipt["날짜"].min() if not receipt.empty else datetime.date.today() - datetime.timedelta(days=365)
-        _max_date = receipt["날짜"].max() if not receipt.empty else datetime.date.today()
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            _cur_range = st.date_input(
-                "당기 기간",
-                value=(_max_date.replace(day=1), _max_date),
-                min_value=_min_date, max_value=_max_date,
-                key="sg_cur_range",
-            )
-        with dc2:
-            _prev_start_default = (_max_date.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
-            _prev_end_default   = _max_date.replace(day=1) - datetime.timedelta(days=1)
-            _prev_range = st.date_input(
-                "전기 기간",
-                value=(_prev_start_default, _prev_end_default),
-                min_value=_min_date, max_value=_max_date,
-                key="sg_prev_range",
-            )
-        if isinstance(_cur_range, (list, tuple)) and len(_cur_range) == 2:
-            sg_cur_period = (_cur_range[0], _cur_range[1])
-        if isinstance(_prev_range, (list, tuple)) and len(_prev_range) == 2:
-            sg_prev_period = (_prev_range[0], _prev_range[1])
-
-    compare_key = "week" if "전주" in sg_compare else "month"
-    site_filter = None if sg_site == "전체" else sg_site
-
-    signal_data = build_gubun_signal(
-        receipt,
-        compare=compare_key,
-        threshold=float(sg_threshold),
-        site=site_filter,
-        cur_period=sg_cur_period,
-        prev_period=sg_prev_period,
-    )
-
-    level = signal_data["signal"]["level"]
-    message = signal_data["signal"]["message"]
+def _render_signal_badge(signal_data: dict, threshold: float) -> None:
+    """가격정책 신호 배지 + 대분류별 변화 렌더링."""
+    sig = signal_data.get("signal", {})
+    level = sig.get("level", "gray")
+    message = sig.get("message", "")
     period_label = (
-        f"{signal_data['cur_start']} ~ {signal_data['cur_end']} "
-        f"vs {signal_data['prev_start']} ~ {signal_data['prev_end']}"
+        f"{signal_data.get('cur_start')} ~ {signal_data.get('cur_end')} "
+        f"vs {signal_data.get('prev_start')} ~ {signal_data.get('prev_end')}"
     )
-
-    LEVEL_STYLE = {
-        "red":    ("🔴", "#fef2f2", "#b91c1c"),
-        "yellow": ("🟡", "#fffbeb", "#92400e"),
-        "green":  ("🟢", "#f0fdf4", "#166534"),
-        "gray":   ("⚪", "#f8fafc", "#475569"),
-    }
-    icon, bg, color = LEVEL_STYLE.get(level, LEVEL_STYLE["gray"])
+    icon, bg, color = _SIGNAL_LEVEL_STYLE.get(level, _SIGNAL_LEVEL_STYLE["gray"])
     st.markdown(
         f'<div style="background:{bg};border-left:4px solid {color};'
-        f'border-radius:0.5rem;padding:12px 16px;margin-bottom:12px;">'
-        f'<span style="font-size:1.1rem;font-weight:700;color:{color}">{icon} {message}</span>'
+        f'border-radius:0.5rem;padding:12px 16px;margin-bottom:8px;">'
+        f'<span style="font-size:1.05rem;font-weight:700;color:{color}">{icon} {message}</span>'
         f'<div style="font-size:0.75rem;color:#64748b;margin-top:4px">비교 기간: {period_label}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # ── 대분류×구분 상세 변화 요약 ─────────────────────────────────
     _POLICY_GUBUN_ORDER = ["유통", "MOU", "전용야드"]
-    threshold_val = float(sg_threshold)
-
-    # by_grade_group 에서 정책 구분 + 유의미한 변화만 추출
-    sig_changes: dict[str, list] = defaultdict(list)   # gubun → [(grade, pct), ...]
+    sig_changes: dict[str, list] = defaultdict(list)
     for k, v in signal_data.get("by_grade_group", {}).items():
         grade = k[0] if isinstance(k, tuple) else k
         gubun = k[1] if isinstance(k, tuple) else k
-        if gubun in _POLICY_GUBUN_ORDER and abs(v["pct"]) >= threshold_val:
+        if gubun in _POLICY_GUBUN_ORDER and abs(v["pct"]) >= threshold:
             sig_changes[gubun].append((grade, v["pct"]))
 
     active_gubun = [g for g in _POLICY_GUBUN_ORDER if g in sig_changes]
@@ -962,16 +906,15 @@ def _render_gubun_signal_section(receipt: pd.DataFrame, api_key: str | None = No
         detail_cols = st.columns(len(active_gubun))
         for ci, gubun in enumerate(active_gubun):
             with detail_cols[ci]:
-                items_sorted = sorted(sig_changes[gubun], key=lambda x: x[1])
                 rows_html = ""
-                for grade, pct in items_sorted:
-                    arrow = "▲" if pct > 0 else "▼"
-                    color = "#16a34a" if pct > 0 else "#dc2626"
+                for grade, pct in sorted(sig_changes[gubun], key=lambda x: x[1]):
+                    arrow = "+" if pct > 0 else "△"
+                    clr = "#16a34a" if pct > 0 else "#dc2626"
                     rows_html += (
                         f'<div style="display:flex;justify-content:space-between;'
                         f'font-size:0.82rem;padding:2px 0;">'
                         f'<span>{grade}</span>'
-                        f'<span style="color:{color};font-weight:600">{arrow} {pct:+.1f}%</span>'
+                        f'<span style="color:{clr};font-weight:600">{arrow} {pct:+.1f}%</span>'
                         f'</div>'
                     )
                 st.markdown(
@@ -980,66 +923,6 @@ def _render_gubun_signal_section(receipt: pd.DataFrame, api_key: str | None = No
                     f'{rows_html}</div>',
                     unsafe_allow_html=True,
                 )
-    else:
-        st.caption(f"유의미한 변화 없음 (임계값 ±{sg_threshold}% 미만)")
-
-    st.divider()
-
-    _sg_tab1, _sg_tab2, _sg_tab3 = st.tabs(["구분별", "대분류별", "대분류×구분"])
-
-    cur_label  = f"당기({signal_data['cur_start']}~{signal_data['cur_end']})"
-    prev_label = f"전기({signal_data['prev_start']}~{signal_data['prev_end']})"
-
-    with _sg_tab1:
-        all_groups = {k: v for k, v in signal_data["by_group"].items()}
-        if all_groups:
-            with st.container(border=True):
-                if any(k in all_groups for k in ("회수", "수입")):
-                    st.caption("* 회수·수입은 가격 정책 영향 없음 (참고)")
-                st.plotly_chart(
-                    make_gubun_signal_bar(all_groups, label_current=cur_label, label_prev=prev_label),
-                    use_container_width=True,
-                )
-        else:
-            st.info("데이터 없음")
-
-    with _sg_tab2:
-        if signal_data.get("by_grade"):
-            st.plotly_chart(
-                make_gubun_signal_bar(signal_data["by_grade"], label_current=cur_label, label_prev=prev_label),
-                use_container_width=True,
-            )
-        else:
-            st.info("데이터 없음")
-
-    with _sg_tab3:
-        grade_policy = {
-            k: v for k, v in signal_data.get("by_grade_group", {}).items()
-            if (k[1] if isinstance(k, tuple) else k) not in ("회수", "수입")
-        }
-        if grade_policy:
-            # 대분류별 총 입고량(당기+전기) 기준 내림차순 정렬
-            grade_totals = {}
-            for k, v in grade_policy.items():
-                grade = k[0] if isinstance(k, tuple) else k
-                grade_totals[grade] = grade_totals.get(grade, 0) + v["current"] + v["prev"]
-            grades_order = sorted(grade_totals, key=lambda g: grade_totals[g], reverse=True)
-
-            # 2개씩 행 배치
-            for row_start in range(0, len(grades_order), 2):
-                row_grades = grades_order[row_start: row_start + 2]
-                cols = st.columns(len(row_grades))
-                for ci, grade in enumerate(row_grades):
-                    grade_subset = {k: v for k, v in grade_policy.items() if isinstance(k, tuple) and k[0] == grade}
-                    with cols[ci]:
-                        with st.container(border=True):
-                            st.markdown(f"**{grade}**")
-                            st.plotly_chart(
-                                make_gubun_signal_bar(grade_subset, label_current=cur_label, label_prev=prev_label),
-                                use_container_width=True,
-                            )
-        else:
-            st.info("데이터 없음")
 
 
 def render():
@@ -1234,7 +1117,17 @@ def render():
     st.header("입고 상세")
     st.caption("기간·사소·구분·공급사·품목·등급 기준 입하 실적 조회")
 
-    _compare_mode = st.toggle("기간 비교 모드", value=False, key="receipt_compare_mode")
+    _tog_c1, _tog_c2, _ = st.columns([1, 1, 3])
+    with _tog_c1:
+        _compare_mode = st.toggle("기간 비교 모드", value=False, key="receipt_compare_mode")
+    with _tog_c2:
+        daily_avg_mode = st.toggle(
+            "일평균 입고량 기준",
+            value=False,
+            key="cmp_daily_avg_mode",
+            help="두 기간의 영업일수 차이를 보정해 일평균 입고량으로 비교합니다.",
+            disabled=not _compare_mode,
+        )
 
     receipt = _preprocess_receipt(receipt_raw, grade_lookup, supplier_gubuns, gubun_grades, region_ref)
 
@@ -1252,80 +1145,88 @@ def render():
         # ── 기간 비교 모드 ─────────────────────────────────────
         st.caption("빠른 선택 또는 직접 설정으로 두 기간을 비교합니다.")
 
-        _qc1, _qc2, _qc3, _ = st.columns([1, 1, 1, 3])
-        _quick = None
-        with _qc1:
-            if st.button("전월 비교", key="quick_prev_month"):
-                _quick = "prev_month"
-        with _qc2:
-            if st.button("전분기 비교", key="quick_prev_quarter"):
-                _quick = "prev_quarter"
-        with _qc3:
-            if st.button("전년동기 비교", key="quick_prev_year"):
-                _quick = "prev_year"
+        _dd_c1, _site_col = st.columns([2, 3])
+        with _dd_c1:
+            _quick_sel = st.selectbox(
+                "비교 방식",
+                ["전주 비교", "전월 비교", "전분기 비교", "전년동기 비교", "직접 선택"],
+                key="cmp_quick_sel",
+            )
+        with _site_col:
+            site_opts2 = ["전체"] + sorted(receipt["사소구분"].dropna().unique().tolist())
+            f_site = st.selectbox("사소 필터", site_opts2, key="site2_cmp")
 
-        if _quick == "prev_month":
-            st.session_state["cmp_a_start"] = _sel_start
-            st.session_state["cmp_a_end"]   = _sel_end
+        # 비교 방식에 따른 기간 계산
+        if _quick_sel == "전주 비교":
+            _wday_a = (max_date.weekday() + 1) % 7
+            _this_sun = max_date - datetime.timedelta(days=_wday_a)
+            _prev_sat = _this_sun - datetime.timedelta(days=1)
+            _prev_sun = _prev_sat - datetime.timedelta(days=(_prev_sat.weekday() + 1) % 7)
+            cmp_a_start, cmp_a_end = _this_sun, max_date
+            cmp_b_start = max(_prev_sun, min_date)
+            cmp_b_end   = max(_prev_sat, min_date)
+
+        elif _quick_sel == "전월 비교":
+            cmp_a_start, cmp_a_end = _sel_start, _sel_end
             _b_end = _sel_start - datetime.timedelta(days=1)
-            st.session_state["cmp_b_start"] = _b_end.replace(day=1)
-            st.session_state["cmp_b_end"]   = _b_end
-        elif _quick == "prev_quarter":
-            st.session_state["cmp_a_start"] = _sel_start
-            st.session_state["cmp_a_end"]   = _sel_end
-            st.session_state["cmp_b_start"] = max(_sel_start - datetime.timedelta(days=90), min_date)
-            st.session_state["cmp_b_end"]   = max(_sel_end   - datetime.timedelta(days=90), min_date)
-        elif _quick == "prev_year":
-            try:
-                st.session_state["cmp_a_start"] = _sel_start
-                st.session_state["cmp_a_end"]   = _sel_end
-                st.session_state["cmp_b_start"] = max(_sel_start.replace(year=_sel_start.year - 1), min_date)
-                st.session_state["cmp_b_end"]   = max(_sel_end.replace(year=_sel_end.year - 1), min_date)
-            except ValueError:
-                pass
+            cmp_b_start, cmp_b_end = _b_end.replace(day=1), _b_end
 
-        _da_c1, _da_c2, _db_c1, _db_c2 = st.columns(4)
-        with _da_c1:
-            cmp_a_start = st.date_input(
-                "A기간 시작", key="cmp_a_start",
-                value=st.session_state.get("cmp_a_start", _sel_start),
-                min_value=min_date, max_value=max_date,
-            )
-        with _da_c2:
-            cmp_a_end = st.date_input(
-                "A기간 종료", key="cmp_a_end",
-                value=st.session_state.get("cmp_a_end", _sel_end),
-                min_value=min_date, max_value=max_date,
-            )
-        with _db_c1:
-            _b_def_start = st.session_state.get(
-                "cmp_b_start",
-                max((_sel_start - datetime.timedelta(days=31)).replace(day=1), min_date),
-            )
-            cmp_b_start = st.date_input(
-                "B기간 시작", key="cmp_b_start",
-                value=_b_def_start,
-                min_value=min_date, max_value=max_date,
-            )
-        with _db_c2:
-            _b_def_end = st.session_state.get(
-                "cmp_b_end",
-                max(_sel_start - datetime.timedelta(days=1), min_date),
-            )
-            cmp_b_end = st.date_input(
-                "B기간 종료", key="cmp_b_end",
-                value=_b_def_end,
-                min_value=min_date, max_value=max_date,
-            )
+        elif _quick_sel == "전분기 비교":
+            cmp_a_start, cmp_a_end = _sel_start, _sel_end
+            cmp_b_start = max(_sel_start - datetime.timedelta(days=90), min_date)
+            cmp_b_end   = max(_sel_end   - datetime.timedelta(days=90), min_date)
+
+        elif _quick_sel == "전년동기 비교":
+            cmp_a_start, cmp_a_end = _sel_start, _sel_end
+            try:
+                cmp_b_start = max(_sel_start.replace(year=_sel_start.year - 1), min_date)
+                cmp_b_end   = max(_sel_end.replace(year=_sel_end.year - 1), min_date)
+            except ValueError:
+                cmp_b_start = cmp_b_end = min_date
+
+        else:  # 직접 선택
+            _da_c1, _da_c2, _db_c1, _db_c2 = st.columns(4)
+            with _da_c1:
+                cmp_a_start = st.date_input(
+                    "A기간 시작", key="cmp_a_start",
+                    value=st.session_state.get("cmp_a_start", _sel_start),
+                    min_value=min_date, max_value=max_date,
+                )
+            with _da_c2:
+                cmp_a_end = st.date_input(
+                    "A기간 종료", key="cmp_a_end",
+                    value=st.session_state.get("cmp_a_end", _sel_end),
+                    min_value=min_date, max_value=max_date,
+                )
+            with _db_c1:
+                cmp_b_start = st.date_input(
+                    "B기간 시작", key="cmp_b_start",
+                    value=st.session_state.get(
+                        "cmp_b_start",
+                        max((_sel_start - datetime.timedelta(days=31)).replace(day=1), min_date),
+                    ),
+                    min_value=min_date, max_value=max_date,
+                )
+            with _db_c2:
+                cmp_b_end = st.date_input(
+                    "B기간 종료", key="cmp_b_end",
+                    value=st.session_state.get(
+                        "cmp_b_end",
+                        max(_sel_start - datetime.timedelta(days=1), min_date),
+                    ),
+                    min_value=min_date, max_value=max_date,
+                )
+
+        # 빠른 선택 시 비교 기간 표시
+        if _quick_sel != "직접 선택":
+            st.caption(f"A기간: {cmp_a_start} ~ {cmp_a_end}  |  B기간: {cmp_b_start} ~ {cmp_b_end}")
 
         start_date = cmp_a_start
         end_date   = cmp_a_end
 
-        site_opts2 = ["전체"] + sorted(receipt["사소구분"].dropna().unique().tolist())
-        f_site = st.selectbox("사소 필터", site_opts2, key="site2_cmp")
-
     else:
         # ── 단일 기간 모드 (기존) ──────────────────────────────
+        daily_avg_mode = False
         fc1, fc2, fc3 = st.columns([1, 1, 1])
         with fc1:
             start_date = st.date_input("시작일", value=_sel_start, min_value=min_date, max_value=max_date)
@@ -1380,32 +1281,90 @@ def render():
         )
         filtered_b = receipt[mask_b]
 
-        label_a = f"{cmp_a_start}~{cmp_a_end}"
-        label_b = f"{cmp_b_start}~{cmp_b_end}"
+        # 분류 기준 라디오 + 신호 임계값 슬라이더
+        _GRP_LABEL_MAP = {
+            "구분별":  "구분",
+            "대분류별": "등급대분류",
+            "등급별":  "등급",
+            "품목별":  "구매item",
+            "공급사별": "공급사",
+        }
+        _grp_row_c1, _grp_row_c2 = st.columns([4, 1])
+        with _grp_row_c1:
+            grp_label = st.radio(
+                "분류 기준",
+                list(_GRP_LABEL_MAP.keys()),
+                horizontal=True,
+                key="cmp_group_label",
+            )
+        with _grp_row_c2:
+            _sig_threshold = st.slider("신호 임계값 (%)", 1, 20, 5, key="sig_threshold_inline")
+        grp_col = _GRP_LABEL_MAP[grp_label]
 
-        grp_col_options = ["구분", "구매item", "등급대분류", "공급사"]
-        grp_col = st.selectbox("비교 기준", grp_col_options, key="cmp_group_col")
+        # 일평균 모드: 영업일수로 나누어 비교
+        if daily_avg_mode:
+            wdays_a = _count_working_days(cmp_a_start, cmp_a_end)
+            wdays_b = _count_working_days(cmp_b_start, cmp_b_end)
+            _fa = filtered.copy()
+            _fb = filtered_b.copy()
+            _fa["입하량(net)"] = _fa["입하량(net)"] / wdays_a
+            _fb["입하량(net)"] = _fb["입하량(net)"] / wdays_b
+            label_a = f"{cmp_a_start}~{cmp_a_end} (일평균, {wdays_a}영업일)"
+            label_b = f"{cmp_b_start}~{cmp_b_end} (일평균, {wdays_b}영업일)"
+            ylabel = "일평균 입고량(t)"
+        else:
+            _fa, _fb = filtered, filtered_b
+            label_a = f"{cmp_a_start}~{cmp_a_end}"
+            label_b = f"{cmp_b_start}~{cmp_b_end}"
+            ylabel = "입고량(t)"
+
+        # 가격정책 신호 (차트 위)
+        try:
+            _sig_data = build_gubun_signal(
+                receipt_no_date,
+                cur_period=(cmp_a_start, cmp_a_end),
+                prev_period=(cmp_b_start, cmp_b_end),
+                threshold=float(_sig_threshold),
+            )
+            _render_signal_badge(_sig_data, float(_sig_threshold))
+        except Exception:
+            pass
 
         st.plotly_chart(
-            make_comparison_bar(filtered, filtered_b, label_a, label_b, group_col=grp_col),
+            make_comparison_bar(_fa, _fb, label_a, label_b, group_col=grp_col, ylabel=ylabel),
             use_container_width=True,
         )
 
-        agg_a = filtered.groupby(grp_col)["입하량(net)"].sum().rename("A기간")
-        agg_b = filtered_b.groupby(grp_col)["입하량(net)"].sum().rename("B기간")
+        agg_a = _fa.groupby(grp_col)["입하량(net)"].sum().rename("A기간")
+        agg_b = _fb.groupby(grp_col)["입하량(net)"].sum().rename("B기간")
         cmp_tbl = pd.concat([agg_a, agg_b], axis=1).fillna(0)
         cmp_tbl["증감량"] = cmp_tbl["A기간"] - cmp_tbl["B기간"]
-        cmp_tbl["증감률(%)"] = (
+        _pct_raw = (
             (cmp_tbl["A기간"] - cmp_tbl["B기간"])
             / cmp_tbl["B기간"].replace(0, float("nan")) * 100
         ).round(1)
+        cmp_tbl["증감률"] = _pct_raw.apply(
+            lambda x: (f"+{x:.1f}%" if x > 0 else (f"△{abs(x):.1f}%" if x < 0 else "0.0%"))
+            if pd.notna(x) else ""
+        )
+
+        def _pct_color(val: str) -> str:
+            if str(val).startswith("+"):
+                return "color: #16a34a; font-weight: 600"
+            if str(val).startswith("△"):
+                return "color: #dc2626; font-weight: 600"
+            return ""
+
+        _num_fmt = "%,.1f" if daily_avg_mode else "%,.0f"
+        _tbl = cmp_tbl.reset_index().sort_values("A기간", ascending=False)
         st.dataframe(
-            cmp_tbl.reset_index().sort_values("A기간", ascending=False),
+            _tbl.style.map(_pct_color, subset=["증감률"]),
             use_container_width=True, hide_index=True,
             column_config={
-                "A기간": st.column_config.NumberColumn(format="%,.0f"),
-                "B기간": st.column_config.NumberColumn(format="%,.0f"),
-                "증감량": st.column_config.NumberColumn(format="%,.0f"),
+                "A기간":  st.column_config.NumberColumn(format=_num_fmt),
+                "B기간":  st.column_config.NumberColumn(format=_num_fmt),
+                "증감량": st.column_config.NumberColumn(format=_num_fmt),
+                "증감률": st.column_config.TextColumn(),
             },
         )
     else:
@@ -1494,11 +1453,7 @@ def render():
         else:
             st.info("조회된 데이터가 없습니다.")
 
-    # ── 섹션 3: 구분별 가격정책 신호 ──────────────────────────
-    st.divider()
-    _render_gubun_signal_section(receipt, api_key=api_key if api_key else None)
-
-    # ── 섹션 4: 지도 + AI 챗봇 (좌/우 배치) ───────────────────
+    # ── 섹션 3: 지도 + AI 챗봇 (좌/우 배치) ───────────────────
     st.divider()
     _map_col, _chat_col = st.columns([1, 1])
 
