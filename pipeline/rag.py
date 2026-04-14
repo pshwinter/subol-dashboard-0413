@@ -134,6 +134,14 @@ def build_chunks(daily: pd.DataFrame, supplier_df: pd.DataFrame) -> list[str]:
             f"사용 {_fmt(grp['use_qty'].sum())}, 재고 {_fmt(inv)}"
         )
 
+    # ── 7-1. 날짜×사소×품목 교차 재고 ───────────────────────
+    for (date, site, item), grp in actual.groupby(["date", "사소구분", "구매item"]):
+        inv_val = grp["inv"].iloc[-1] if not grp.empty else 0
+        chunks.append(
+            f"{site} {item} {date} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용 {_fmt(grp['use_qty'].sum())}, 재고 {_fmt(inv_val)}"
+        )
+
     # ── 8. 공급사별 요약 ─────────────────────────────────────
     for (company, gubun), grp in supplier_df.groupby(["공급사명", "구분"]):
         sites_s = ", ".join(grp["사소구분"].unique())

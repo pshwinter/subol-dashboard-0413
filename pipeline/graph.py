@@ -35,10 +35,14 @@ class ChatState(TypedDict):
 ROUTER_PROMPT = """\
 사용자 질문을 아래 두 유형 중 하나로 분류하세요.
 
-[rag] - 단순 데이터 조회: 특정 수치, 현황, 목록 조회
-  예) "포항소 재고는?", "가장 많이 납품한 공급사는?", "ADS01 입고량"
+[rag] - 전체 기간 요약 조회: 특정 날짜 없이 현황·합계·순위 조회
+  예) "포항소 전체 재고는?", "가장 많이 납품한 공급사는?", "ADS01 전체 입고량"
 
-[analysis] - 데이터 분석·계산·비교·통계: 집계, 비율, 추이, 상관관계
+[analysis] - 아래 중 하나에 해당하면 반드시 [analysis]
+  1. 특정 날짜(월·일)가 명시된 재고/입고/사용 조회
+     예) "4월 13일 ADS01 재고", "3월 포항소 입고량", "2026-04-10 재고"
+  2. 날짜+사소+품목 조합 필터가 필요한 조회
+  3. 집계, 비율, 추이, 달성률, 상관관계 등 계산
   예) "사용량이 가장 많은 달은?", "계획 대비 실적 달성률", "품목별 재고 비율"
 
 질문: {query}
@@ -65,6 +69,8 @@ ANALYSIS_SYSTEM = """\
 
 사용 가능한 변수:
 - daily: 수불 일별 데이터 (컬럼: 사소구분, 구매item, date, recv_qty, use_qty, inv, is_actual)
+  * date 컬럼은 "YYYY-MM-DD" 문자열 형식입니다.
+  * inv 컬럼은 해당 날짜의 누적 재고(기초재고 포함)입니다.
 - supplier_df: 공급사 집계 (컬럼: 공급사명, 구분, 사소구분, ITEM, recv_qty)
 - gubun_summary: 구분별 당월/전월 입고량 요약 DataFrame
   (컬럼: 구분그룹, 당기입고량, 전기입고량, 증감률)
@@ -76,8 +82,23 @@ ANALYSIS_SYSTEM = """\
 - 기간의 기준은 당일 07:00 ~ 익일 06:59가 하루 데이터입니다.
 - import는 pandas, numpy만 허용합니다.
 - 한국어로 답변하는 코드를 작성하세요.
+- 날짜 필터: "4월 13일" → "2026-04-13", "3월" → date.str.startswith("2026-03") 형식으로 변환.
+  연도가 불명확하면 daily["date"].max()에서 연도를 추출해 사용하세요.
 
-예시:
+특정 날짜의 재고 조회 예시 (포항소 4월 13일 ADS01 재고):
+```python
+actual = daily[daily["is_actual"]]
+year = pd.to_datetime(actual["date"].max()).year
+target_date = f"{year}-04-13"
+mask = (actual["사소구분"] == "포항소") & (actual["구매item"] == "ADS01") & (actual["date"] == target_date)
+row = actual[mask]
+if row.empty:
+    result = "해당 데이터가 없습니다"
+else:
+    result = f"포항소 ADS01 {target_date} 재고: {row['inv'].iloc[-1]:,.0f}"
+```
+
+집계 조회 예시 (사용량 상위 품목):
 ```python
 actual = daily[daily["is_actual"]]
 top = actual.groupby("구매item")["use_qty"].sum().sort_values(ascending=False)
