@@ -88,31 +88,31 @@ def build_chunks(daily: pd.DataFrame, supplier_df: pd.DataFrame) -> list[str]:
     for site, grp in actual.groupby("사소구분"):
         inv = _last_inv(grp)
         chunks.append(
-            f"{site} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 현재 재고 {_fmt(inv)}"
+            f"{site} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 현재 재고 {_fmt(inv)}"
         )
 
     # ── 4. 품목별 요약 ────────────────────────────────────────
     for item, grp in actual.groupby("구매item"):
         inv = _last_inv(grp)
         chunks.append(
-            f"품목 {item} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 현재 재고 {_fmt(inv)}"
+            f"품목 {item} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 현재 재고 {_fmt(inv)}"
         )
 
     # ── 5. 사소×품목 교차 ────────────────────────────────────
     for (site, item), grp in actual.groupby(["사소구분", "구매item"]):
         inv = grp.sort_values("date")["inv"].iloc[-1] if not grp.empty else 0
         chunks.append(
-            f"{site} {item} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 현재 재고 {_fmt(inv)}"
+            f"{site} {item} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 현재 재고 {_fmt(inv)}"
         )
         # 계획도 추가
         p_grp = plan[(plan["사소구분"] == site) & (plan["구매item"] == item)]
         if not p_grp.empty:
             chunks.append(
-                f"{site} {item} 계획: 예상 입고 {_fmt(p_grp['recv_qty'].sum())}, "
-                f"예상 사용 {_fmt(p_grp['use_qty'].sum())}"
+                f"{site} {item} 계획: 예상 입고량 {_fmt(p_grp['recv_qty'].sum())}, "
+                f"예상 사용량 {_fmt(p_grp['use_qty'].sum())}"
             )
 
     # ── 6. 월별 요약 ─────────────────────────────────────────
@@ -121,49 +121,78 @@ def build_chunks(daily: pd.DataFrame, supplier_df: pd.DataFrame) -> list[str]:
     for month, grp in actual2.groupby("month"):
         inv = _last_inv(grp)
         chunks.append(
-            f"{month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
+            f"{month} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
         )
 
     # ── 6-1. 월×사소 교차 ────────────────────────────────────
     for (month, site), grp in actual2.groupby(["month", "사소구분"]):
         inv = _last_inv(grp)
         chunks.append(
-            f"{site} {month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
+            f"{site} {month} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
         )
 
     # ── 6-2. 월×품목 교차 ────────────────────────────────────
     for (month, item), grp in actual2.groupby(["month", "구매item"]):
         inv = _last_inv(grp)
         chunks.append(
-            f"품목 {item} {month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
+            f"품목 {item} {month} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
         )
 
     # ── 6-3. 월×사소×품목 교차 ──────────────────────────────
     for (month, site, item), grp in actual2.groupby(["month", "사소구분", "구매item"]):
         inv_val = grp.sort_values("date")["inv"].iloc[-1] if not grp.empty else 0
         chunks.append(
-            f"{site} {item} {month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv_val)}"
+            f"{site} {item} {month} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv_val)}"
         )
 
     # ── 7. 일자별 실적 ────────────────────────────────────────
-    # inv는 사소×품목별 마지막 값 합산으로 정확히 계산
     for date, grp in actual.groupby("date"):
         inv = _last_inv(grp)
         chunks.append(
-            f"{date} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 재고 {_fmt(inv)}"
+            f"{date} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 재고 {_fmt(inv)}"
         )
 
-    # ── 7-1. 날짜×사소×품목 교차 재고 ───────────────────────
+    # ── 7-1. 날짜×사소×품목 교차 ────────────────────────────
     for (date, site, item), grp in actual.groupby(["date", "사소구분", "구매item"]):
         inv_val = grp["inv"].iloc[-1] if not grp.empty else 0
         chunks.append(
-            f"{site} {item} {date} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
-            f"사용 {_fmt(grp['use_qty'].sum())}, 재고 {_fmt(inv_val)}"
+            f"{site} {item} {date} 실적: 입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용량 {_fmt(grp['use_qty'].sum())}, 재고 {_fmt(inv_val)}"
+        )
+
+    # ── 7-2. 사소별 일자 사용량 전용 ────────────────────────
+    for (date, site), grp in actual.groupby(["date", "사소구분"]):
+        chunks.append(
+            f"{site} {date} 사용량: {_fmt(grp['use_qty'].sum())}"
+        )
+
+    # ── 7-3. 품목별 일자 사용량 전용 ────────────────────────
+    for (date, item), grp in actual.groupby(["date", "구매item"]):
+        chunks.append(
+            f"품목 {item} {date} 사용량: {_fmt(grp['use_qty'].sum())}"
+        )
+
+    # ── 6-4. 월별 사소 사용량 전용 ──────────────────────────
+    for (month, site), grp in actual2.groupby(["month", "사소구분"]):
+        chunks.append(
+            f"{site} {month} 사용량: {_fmt(grp['use_qty'].sum())}"
+        )
+
+    # ── 6-5. 월별 품목 사용량 전용 ──────────────────────────
+    for (month, item), grp in actual2.groupby(["month", "구매item"]):
+        chunks.append(
+            f"품목 {item} {month} 사용량: {_fmt(grp['use_qty'].sum())}"
+        )
+
+    # ── 6-6. 월×사소×품목 사용량 전용 ───────────────────────
+    for (month, site, item), grp in actual2.groupby(["month", "사소구분", "구매item"]):
+        chunks.append(
+            f"{site} {item} {month} 사용량: {_fmt(grp['use_qty'].sum())}"
         )
 
     # ── 8. 공급사별 요약 ─────────────────────────────────────
