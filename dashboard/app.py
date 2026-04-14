@@ -914,7 +914,7 @@ def _render_signal_badge(signal_data: dict, threshold: float) -> None:
                         f'<div style="display:flex;justify-content:space-between;'
                         f'font-size:0.82rem;padding:2px 0;">'
                         f'<span>{grade}</span>'
-                        f'<span style="color:{clr};font-weight:600">{arrow} {pct:+.1f}%</span>'
+                        f'<span style="color:{clr};font-weight:600">{arrow}{abs(pct):.1f}%</span>'
                         f'</div>'
                     )
                 st.markdown(
