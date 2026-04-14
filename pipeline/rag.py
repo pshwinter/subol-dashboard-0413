@@ -125,6 +125,30 @@ def build_chunks(daily: pd.DataFrame, supplier_df: pd.DataFrame) -> list[str]:
             f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
         )
 
+    # ── 6-1. 월×사소 교차 ────────────────────────────────────
+    for (month, site), grp in actual2.groupby(["month", "사소구분"]):
+        inv = _last_inv(grp)
+        chunks.append(
+            f"{site} {month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
+        )
+
+    # ── 6-2. 월×품목 교차 ────────────────────────────────────
+    for (month, item), grp in actual2.groupby(["month", "구매item"]):
+        inv = _last_inv(grp)
+        chunks.append(
+            f"품목 {item} {month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv)}"
+        )
+
+    # ── 6-3. 월×사소×품목 교차 ──────────────────────────────
+    for (month, site, item), grp in actual2.groupby(["month", "사소구분", "구매item"]):
+        inv_val = grp.sort_values("date")["inv"].iloc[-1] if not grp.empty else 0
+        chunks.append(
+            f"{site} {item} {month} 실적: 입고 {_fmt(grp['recv_qty'].sum())}, "
+            f"사용 {_fmt(grp['use_qty'].sum())}, 월말 재고 {_fmt(inv_val)}"
+        )
+
     # ── 7. 일자별 실적 ────────────────────────────────────────
     # inv는 사소×품목별 마지막 값 합산으로 정확히 계산
     for date, grp in actual.groupby("date"):
@@ -149,6 +173,29 @@ def build_chunks(daily: pd.DataFrame, supplier_df: pd.DataFrame) -> list[str]:
         chunks.append(
             f"공급사 {company} (구분: {gubun}): "
             f"입고량 {_fmt(grp['recv_qty'].sum())}, "
+            f"납품 사업장: {sites_s}, 취급 품목: {items_s}"
+        )
+
+    # ── 8-1. 월별 공급사 입고량 ──────────────────────────────
+    # supplier_df에는 날짜 없음 → actual(daily)에서 공급사 컬럼 병합 필요
+    # actual에 공급사명 컬럼이 없으므로, supplier_df 기준으로 사소×품목 매핑 후 월별 집계
+    if "공급사명" in actual.columns:
+        actual_sup = actual.copy()
+    else:
+        # 사소구분+구매item → 공급사명 매핑 (동일 조합에 공급사 여러 개면 각각 분리)
+        sup_map = (
+            supplier_df[["사소구분", "ITEM", "공급사명", "구분"]]
+            .drop_duplicates()
+            .rename(columns={"ITEM": "구매item"})
+        )
+        actual_sup = actual.merge(sup_map, on=["사소구분", "구매item"], how="left")
+
+    actual_sup["month"] = pd.to_datetime(actual_sup["date"]).dt.to_period("M")
+    for (month, company), grp in actual_sup.dropna(subset=["공급사명"]).groupby(["month", "공급사명"]):
+        sites_s = ", ".join(grp["사소구분"].unique())
+        items_s = ", ".join(grp["구매item"].dropna().unique())
+        chunks.append(
+            f"공급사 {company} {month} 입고량: {_fmt(grp['recv_qty'].sum())}, "
             f"납품 사업장: {sites_s}, 취급 품목: {items_s}"
         )
 
