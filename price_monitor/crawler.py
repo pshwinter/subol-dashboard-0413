@@ -414,10 +414,16 @@ def _detect_direction(title: str, text: str) -> tuple[int, str]:
     """기사 제목·본문에서 가격 변동 방향과 액션 문자열 결정.
 
     우선순위:
-    1. 명시적 방향 키워드 (인상/인하/보합 등)
-    2. 운임보조 기사 → 가격 집계 제외 (0 반환)
-    3. 특구/특별구매 기사 → 인상(1) 처리
+    1. 제목에 동결/보합/유지가 있으면 본문 무관하게 0 반환 (최우선)
+    2. 명시적 방향 키워드 (인상/인하/보합 등) — 제목 우선, 본문 보조
+    3. 운임보조 기사 → 가격 집계 제외 (0 반환)
+    4. 특구/특별구매 기사 → 인상(1) 처리
     """
+    # 제목에 중립(동결/보합/유지) 키워드가 있으면 본문의 인상/인하를 무시
+    for neutral in ("동결", "보합", "유지"):
+        if neutral in title:
+            return 0, neutral
+
     for action, direction in CHANGE_DIRECTION.items():
         if action in title or action in text[:300]:
             return direction, action
@@ -501,6 +507,12 @@ def _extract_prices_from_body(
     pub = _PUB_DATE_RE.search(soup.get_text())
     if pub:
         article_date = f"{pub.group(1)}-{int(pub.group(2)):02d}-{int(pub.group(3)):02d}"
+    elif article_date == date.today().isoformat():
+        # 목록 페이지 날짜 파싱도 실패해 today() 폴백이 된 경우:
+        # _effective_date가 현재 월을 기준으로 잘못된 날짜를 만드는 것을 방지.
+        # 본문에서 발행일을 찾지 못했으므로 article_date는 그대로 두되
+        # _effective_date는 건너뛰고 article_date 자체를 사용한다.
+        article_date = date.today().isoformat()
 
     # 회사명: 제목 우선, 본문에 더 구체적인 지점명이 있으면 교체
     co_title = extract_company(title)
@@ -510,8 +522,13 @@ def _extract_prices_from_body(
     else:
         company = co_title or co_body
 
-    category              = "수입" if company in IMPORT_COMPANIES else "국내"
-    eff_date              = _effective_date(text, article_date)
+    category = "수입" if company in IMPORT_COMPANIES else "국내"
+    # article_date가 today() 폴백이면 _effective_date 사용 금지 (날짜 오염 방지)
+    eff_date = (
+        _effective_date(text, article_date)
+        if article_date != date.today().isoformat()
+        else article_date
+    )
     article_direction, article_action = _detect_direction(title, text)
     fallback_grade        = extract_grade(title) or extract_grade(text[:300])
 

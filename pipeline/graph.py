@@ -19,6 +19,7 @@ import pandas as pd
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pipeline.transform import standardize_movement_df
 
 
 # ── 상태 정의 (add_messages 적용) ────────────────────────────
@@ -36,7 +37,7 @@ ROUTER_PROMPT = """\
 사용자 질문을 아래 두 유형 중 하나로 분류하세요.
 
 [rag] - 전체 기간 요약만 해당: 날짜·월 조건 없이 전체 현황·순위만 조회
-  예) "포항소 전체 재고는?", "가장 많이 납품한 공급사는?"
+  예) "포항소 전체 재고는?", "포항소 ADS01 재고", "가장 많이 납품한 공급사는?", "광양소 입고량 현황"
 
 [analysis] - 아래 중 하나라도 해당하면 반드시 [analysis]
   1. 특정 월(1월~12월) 또는 날짜가 질문에 포함된 경우
@@ -45,6 +46,9 @@ ROUTER_PROMPT = """\
      예) "포항소 3월 ADS01 입고량", "광양소 ADS01 4월 재고"
   3. 합계·평균·비율·추이·달성률 등 집계 계산이 필요한 경우
      예) "사용량이 가장 많은 달", "계획 대비 달성률", "품목별 재고 비율"
+  4. 특정 공급사명이 질문에 포함된 경우 (날짜/월 조건 유무 관계없이)
+     - 주의: 포항소·광양소는 공장(사소) 이름이므로 공급사가 아님
+     예) "공급사01 4월 입고량", "현대제철 3월 납품량", "포스코 입고량"
 
 질문: {query}
 
@@ -72,9 +76,11 @@ ANALYSIS_SYSTEM = """\
 - daily: 수불 일별 데이터 (컬럼: 사소구분, 구매item, date, recv_qty, use_qty, inv, is_actual)
   * date 컬럼은 "YYYY-MM-DD" 문자열 형식입니다.
   * inv 컬럼은 해당 날짜의 누적 재고(기초재고 포함)입니다.
-- daily_sup: daily에 공급사명·구분이 병합된 데이터
-  (컬럼: 사소구분, 구매item, date, recv_qty, use_qty, inv, is_actual, 공급사명, 구분)
-  * 공급사명 + 날짜/월 조합 필터링이 필요할 때 반드시 이 변수를 사용하세요.
+  * 주의: daily는 모든 공급사를 합산한 데이터입니다. 공급사별 필터링에 사용하지 마세요.
+- receipt_detail: 개별 입고 트랜잭션 데이터 — 공급사명 + 날짜/월 조합 필터링에 반드시 이 변수를 사용하세요.
+  (컬럼: 사소구분, 구매item, date, recv_qty, 공급사명)
+  * date 컬럼은 "YYYY-MM-DD" 문자열 형식 (7시간 오프셋 적용됨)
+  * 이 변수는 실적 데이터만 포함합니다 (is_actual 컬럼 없음 — 별도 필터 불필요)
 - supplier_df: 공급사 전체 기간 집계 (컬럼: 공급사명, 구분, 사소구분, ITEM, recv_qty)
   * 날짜 컬럼 없음 — 전체 기간 합산만 가능
 - gubun_summary: 구분별 당월/전월 입고량 요약 DataFrame
@@ -134,14 +140,31 @@ else:
 
 공급사 + 월 입고량 합계 예시 (공급사01 4월 입고량):
 ```python
-actual_sup = daily_sup[daily_sup["is_actual"]]
-year = pd.to_datetime(actual_sup["date"].max()).year
-mask = actual_sup["공급사명"].str.contains("공급사01") & actual_sup["date"].str.startswith(f"{year}-04")
-filtered = actual_sup[mask]
-if filtered.empty:
+if receipt_detail.empty:
     result = "해당 데이터가 없습니다"
 else:
-    result = f"공급사01 {year}년 4월 입고량: {filtered['recv_qty'].sum():,.0f}"
+    year = pd.to_datetime(receipt_detail["date"].astype(str).max()).year
+    mask = receipt_detail["공급사명"].str.contains("공급사01") & receipt_detail["date"].astype(str).str.startswith(f"{year}-04")
+    filtered = receipt_detail[mask]
+    if filtered.empty:
+        result = "해당 데이터가 없습니다"
+    else:
+        result = f"공급사01 {year}년 4월 입고량: {filtered['recv_qty'].sum():,.0f}"
+```
+
+공급사 + 특정 날짜 입고량 예시 (공급사01 4월 13일 입고량):
+```python
+if receipt_detail.empty:
+    result = "해당 데이터가 없습니다"
+else:
+    year = pd.to_datetime(receipt_detail["date"].astype(str).max()).year
+    target_date = f"{year}-04-13"
+    mask = receipt_detail["공급사명"].str.contains("공급사01") & (receipt_detail["date"].astype(str) == target_date)
+    filtered = receipt_detail[mask]
+    if filtered.empty:
+        result = "해당 데이터가 없습니다"
+    else:
+        result = f"공급사01 {target_date} 입고량: {filtered['recv_qty'].sum():,.0f}"
 ```
 
 집계 조회 예시 (사용량 상위 품목):
@@ -169,7 +192,7 @@ _SAFE_BUILTINS = {k: __builtins__[k] if isinstance(__builtins__, dict) else geta
 
 def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame,
                gubun_summary: pd.DataFrame | None = None,
-               daily_sup: pd.DataFrame | None = None) -> str:
+               receipt_detail: pd.DataFrame | None = None) -> str:
     """LLM이 생성한 pandas 코드를 제한된 환경에서 실행."""
     # 위험 패턴 차단
     for pat in _FORBIDDEN:
@@ -185,7 +208,7 @@ def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame,
         "daily": daily.copy(),
         "supplier_df": supplier_df.copy(),
         "gubun_summary": gubun_summary.copy() if gubun_summary is not None else pd.DataFrame(),
-        "daily_sup": daily_sup.copy() if daily_sup is not None else pd.DataFrame(),
+        "receipt_detail": receipt_detail.copy() if receipt_detail is not None else pd.DataFrame(),
         "result": "결과 없음",
     }
     try:
@@ -210,19 +233,24 @@ def _get_last_human_message(state: ChatState) -> str:
 
 # ── 그래프 빌더 ───────────────────────────────────────────────
 
-def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_key: str, gubun_summary: pd.DataFrame | None = None):
+def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_key: str,
+                gubun_summary: pd.DataFrame | None = None,
+                receipt_raw: pd.DataFrame | None = None):
     """LangGraph StateGraph 생성 및 컴파일."""
     from langchain_openai import ChatOpenAI
 
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, api_key=api_key)
 
-    # ── daily_sup: daily에 공급사명/구분 병합 (분석용) ───────────
-    _sup_map = (
-        supplier_df[["사소구분", "ITEM", "공급사명", "구분"]]
-        .drop_duplicates(subset=["사소구분", "ITEM", "공급사명"])
-        .rename(columns={"ITEM": "구매item"})
-    )
-    daily_sup = daily.merge(_sup_map, on=["사소구분", "구매item"], how="left")
+    # ── receipt_detail: 개별 입고 트랜잭션 (공급사+날짜 조합 조회용) ─
+    if receipt_raw is not None and not receipt_raw.empty:
+        try:
+            _rd = standardize_movement_df(receipt_raw, qty_col="입하량(net)", date_col="입하일시")
+            receipt_detail = _rd.rename(columns={"qty": "recv_qty", "공급사": "공급사명"})
+            receipt_detail["date"] = receipt_detail["date"].astype(str)
+        except Exception:
+            receipt_detail = pd.DataFrame()
+    else:
+        receipt_detail = pd.DataFrame()
 
     # ── 노드 1: 라우터 (LLM 조건부 분기) ────────────────────────
     def router_node(state: ChatState) -> dict:
@@ -263,7 +291,7 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
         generated_code = code_resp.content
 
         # 코드 실행
-        exec_result = _safe_exec(generated_code, daily, supplier_df, gubun_summary, daily_sup)
+        exec_result = _safe_exec(generated_code, daily, supplier_df, gubun_summary, receipt_detail)
 
         # 실행 실패 또는 데이터 없음 → 환각 없이 즉시 반환
         _NO_DATA_SIGNALS = (

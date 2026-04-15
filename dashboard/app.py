@@ -1603,7 +1603,7 @@ def _render_subol_tab():
                                 _gubun_summary_df = pd.DataFrame(_gubun_rows)
                             except Exception:
                                 _gubun_summary_df = pd.DataFrame()
-                            graph = build_graph(daily, supplier_df, retriever, api_key, gubun_summary=_gubun_summary_df)
+                            graph = build_graph(daily, supplier_df, retriever, api_key, gubun_summary=_gubun_summary_df, receipt_raw=receipt_raw)
 
                             init_state = {
                                 "messages": st.session_state.lg_messages + [HumanMessage(content=user_input)],
