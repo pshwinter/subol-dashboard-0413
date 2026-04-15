@@ -72,7 +72,11 @@ ANALYSIS_SYSTEM = """\
 - daily: 수불 일별 데이터 (컬럼: 사소구분, 구매item, date, recv_qty, use_qty, inv, is_actual)
   * date 컬럼은 "YYYY-MM-DD" 문자열 형식입니다.
   * inv 컬럼은 해당 날짜의 누적 재고(기초재고 포함)입니다.
-- supplier_df: 공급사 집계 (컬럼: 공급사명, 구분, 사소구분, ITEM, recv_qty)
+- daily_sup: daily에 공급사명·구분이 병합된 데이터
+  (컬럼: 사소구분, 구매item, date, recv_qty, use_qty, inv, is_actual, 공급사명, 구분)
+  * 공급사명 + 날짜/월 조합 필터링이 필요할 때 반드시 이 변수를 사용하세요.
+- supplier_df: 공급사 전체 기간 집계 (컬럼: 공급사명, 구분, 사소구분, ITEM, recv_qty)
+  * 날짜 컬럼 없음 — 전체 기간 합산만 가능
 - gubun_summary: 구분별 당월/전월 입고량 요약 DataFrame
   (컬럼: 구분그룹, 당기입고량, 전기입고량, 증감률)
 
@@ -128,6 +132,18 @@ else:
     result = f"포항소 ADS01 {year}년 3월 입고량: {filtered['recv_qty'].sum():,.0f}"
 ```
 
+공급사 + 월 입고량 합계 예시 (공급사01 4월 입고량):
+```python
+actual_sup = daily_sup[daily_sup["is_actual"]]
+year = pd.to_datetime(actual_sup["date"].max()).year
+mask = actual_sup["공급사명"].str.contains("공급사01") & actual_sup["date"].str.startswith(f"{year}-04")
+filtered = actual_sup[mask]
+if filtered.empty:
+    result = "해당 데이터가 없습니다"
+else:
+    result = f"공급사01 {year}년 4월 입고량: {filtered['recv_qty'].sum():,.0f}"
+```
+
 집계 조회 예시 (사용량 상위 품목):
 ```python
 actual = daily[daily["is_actual"]]
@@ -151,7 +167,9 @@ _SAFE_BUILTINS = {k: __builtins__[k] if isinstance(__builtins__, dict) else geta
                              "tuple", "set", "isinstance", "print", "type", "any", "all"]}
 
 
-def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame, gubun_summary: pd.DataFrame | None = None) -> str:
+def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame,
+               gubun_summary: pd.DataFrame | None = None,
+               daily_sup: pd.DataFrame | None = None) -> str:
     """LLM이 생성한 pandas 코드를 제한된 환경에서 실행."""
     # 위험 패턴 차단
     for pat in _FORBIDDEN:
@@ -167,6 +185,7 @@ def _safe_exec(code: str, daily: pd.DataFrame, supplier_df: pd.DataFrame, gubun_
         "daily": daily.copy(),
         "supplier_df": supplier_df.copy(),
         "gubun_summary": gubun_summary.copy() if gubun_summary is not None else pd.DataFrame(),
+        "daily_sup": daily_sup.copy() if daily_sup is not None else pd.DataFrame(),
         "result": "결과 없음",
     }
     try:
@@ -196,6 +215,14 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
     from langchain_openai import ChatOpenAI
 
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, api_key=api_key)
+
+    # ── daily_sup: daily에 공급사명/구분 병합 (분석용) ───────────
+    _sup_map = (
+        supplier_df[["사소구분", "ITEM", "공급사명", "구분"]]
+        .drop_duplicates(subset=["사소구분", "ITEM", "공급사명"])
+        .rename(columns={"ITEM": "구매item"})
+    )
+    daily_sup = daily.merge(_sup_map, on=["사소구분", "구매item"], how="left")
 
     # ── 노드 1: 라우터 (LLM 조건부 분기) ────────────────────────
     def router_node(state: ChatState) -> dict:
@@ -236,7 +263,7 @@ def build_graph(daily: pd.DataFrame, supplier_df: pd.DataFrame, retriever, api_k
         generated_code = code_resp.content
 
         # 코드 실행
-        exec_result = _safe_exec(generated_code, daily, supplier_df, gubun_summary)
+        exec_result = _safe_exec(generated_code, daily, supplier_df, gubun_summary, daily_sup)
 
         # 실행 실패 또는 데이터 없음 → 환각 없이 즉시 반환
         _NO_DATA_SIGNALS = (
