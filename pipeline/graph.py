@@ -85,13 +85,30 @@ ANALYSIS_SYSTEM = """\
 - 한국어로 답변하는 코드를 작성하세요.
 - 날짜 필터: "4월 13일" → "2026-04-13", "3월" → date.str.startswith("2026-03") 형식으로 변환.
   연도가 불명확하면 daily["date"].max()에서 연도를 추출해 사용하세요.
+- 사소구분 필터: 사소구분 컬럼 값은 반드시 "포항소" 또는 "광양소"입니다.
+  "포항" → "포항소", "광양" → "광양소" 로 변환하거나,
+  actual["사소구분"].str.contains("포항") 처럼 부분 일치 방식을 사용하세요.
+
+특정 날짜의 입고량 합계 예시 (포항 4월 13일 입고량):
+```python
+actual = daily[daily["is_actual"]]
+year = pd.to_datetime(actual["date"].max()).year
+target_date = f"{year}-04-13"
+# "포항" → str.contains로 "포항소" 매칭
+mask = actual["사소구분"].str.contains("포항") & (actual["date"] == target_date)
+filtered = actual[mask]
+if filtered.empty:
+    result = "해당 데이터가 없습니다"
+else:
+    result = f"포항소 {target_date} 입고량: {filtered['recv_qty'].sum():,.0f}"
+```
 
 특정 날짜의 재고 조회 예시 (포항소 4월 13일 ADS01 재고):
 ```python
 actual = daily[daily["is_actual"]]
 year = pd.to_datetime(actual["date"].max()).year
 target_date = f"{year}-04-13"
-mask = (actual["사소구분"] == "포항소") & (actual["구매item"] == "ADS01") & (actual["date"] == target_date)
+mask = actual["사소구분"].str.contains("포항") & (actual["구매item"] == "ADS01") & (actual["date"] == target_date)
 row = actual[mask]
 if row.empty:
     result = "해당 데이터가 없습니다"
@@ -103,13 +120,12 @@ else:
 ```python
 actual = daily[daily["is_actual"]]
 year = pd.to_datetime(actual["date"].max()).year
-mask = (actual["사소구분"] == "포항소") & (actual["구매item"] == "ADS01") & (actual["date"].str.startswith(f"{year}-03"))
+mask = actual["사소구분"].str.contains("포항") & (actual["구매item"] == "ADS01") & (actual["date"].str.startswith(f"{year}-03"))
 filtered = actual[mask]
 if filtered.empty:
     result = "해당 데이터가 없습니다"
 else:
-    total = filtered["recv_qty"].sum()
-    result = f"포항소 ADS01 {year}년 3월 입고량: {total:,.0f}"
+    result = f"포항소 ADS01 {year}년 3월 입고량: {filtered['recv_qty'].sum():,.0f}"
 ```
 
 집계 조회 예시 (사용량 상위 품목):
