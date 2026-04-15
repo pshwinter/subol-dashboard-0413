@@ -136,6 +136,7 @@ RAG 인덱스: `@st.cache_resource`로 세션 내 1회만 빌드
 ## 메일 발송
 
 `_send_gmail()` — Gmail SMTP SSL (포트 465)
+- 크롤링 스케줄: 매일 07:00, 13:00 (Asia/Seoul)
 - 법인 네트워크 환경에서는 외부 SMTP 차단으로 발송 불가
 - 내부 SMTP 서버 정보 확인 필요 (현재 미해결)
 

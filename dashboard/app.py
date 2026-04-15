@@ -1,5 +1,6 @@
 # dashboard/app.py
 import io
+import os
 import re
 import threading
 import calendar
@@ -23,6 +24,9 @@ from report.exporter import export_workbook_bytes
 
 from pipeline.transform import SITE_MAP, standardize_expected_df
 from pipeline.gubun_signal import build_gubun_signal, _count_working_days
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from price_monitor.crawler import crawl_all, SCRAP_GRADES
 from price_monitor.storage import (
@@ -49,12 +53,12 @@ def _run_crawl() -> None:
 def _init_pm_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
     scheduler = BackgroundScheduler(timezone="Asia/Seoul")
-    scheduler.add_job(_run_crawl, trigger="cron", hour="1,13", minute=0, id="pm_crawl_job")
+    scheduler.add_job(_run_crawl, trigger="cron", hour="7,13", minute=0, id="pm_crawl_job")
     scheduler.start()
     return scheduler
 
 
-_LOAD_VERSION = "v12"   # 코드 변경 시 올려서 캐시 강제 무효화
+_LOAD_VERSION = "v16"   # 코드 변경 시 올려서 캐시 강제 무효화
 
 # 숫자·증감% 색상 강조 패턴 (모듈 레벨 컴파일 — _colorize() 공용)
 _COLORIZE_PATTERN = re.compile(r'(\+[\d.]+%)|(-[\d.]+%)|([\d,]+(?:\.\d+)?)')
@@ -677,22 +681,80 @@ def _receipt_summary(filtered: pd.DataFrame, start_date, end_date, receipt_all=N
     return "\n".join(lines)
 
 
+def _build_price_context() -> str:
+    """최근 30일 타사 구매단가 변동 횟수 요약 (스틸데일리 기준).
+
+    같은 날짜·기사URL·회사를 1회 이벤트로 집계
+    (등급별로 복수 행이 있어도 중복 카운트 안 함).
+    """
+    try:
+        pm = load_prices()
+        if pm.empty:
+            return ""
+        pm["date"] = pd.to_datetime(pm["date"], errors="coerce")
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+        recent = pm[
+            (pm["source"] == "스틸데일리") &
+            (pm["date"] >= cutoff) &
+            pm["action"].isin(["인상", "인하"])
+        ].copy()
+        if recent.empty:
+            return ""
+
+        # 같은 날짜+URL+회사 → 1 이벤트. action은 다수면 인하 우선(보수적).
+        events = (
+            recent
+            .groupby(["date", "url", "company"])["action"]
+            .agg(lambda s: "인하" if (s == "인하").any() else "인상")
+            .reset_index()
+        )
+
+        # 회사별 인상/인하 횟수
+        counts = events.groupby(["company", "action"]).size().unstack(fill_value=0)
+        parts = []
+        for company in counts.index:
+            row = counts.loc[company]
+            items = []
+            if row.get("인하", 0) > 0:
+                items.append(f"{int(row['인하'])}회 인하")
+            if row.get("인상", 0) > 0:
+                items.append(f"{int(row['인상'])}회 인상")
+            if items:
+                parts.append(f"{company} {' '.join(items)}")
+
+        if not parts:
+            return ""
+        return "최근 1달 타사 구매단가 변동 현황: " + ", ".join(parts)
+    except Exception:
+        return ""
+
+
 @st.cache_data(ttl=300)
-def _ai_summary(summary_text: str, _api_key: str) -> str:
+def _ai_summary(summary_text: str, _api_key: str, price_context: str = "") -> str:
     """요약 수치를 GPT에 전달해 2문장 자연어 요약 생성 (5분 캐시)."""
     from openai import OpenAI
 
     client = OpenAI(api_key=_api_key)
+    price_block = (
+        f"\n[최근 1달 타사 구매단가 변동 (스틸데일리 기준)]\n{price_context}\n"
+        if price_context else ""
+    )
     prompt = (
         "당신은 철강 공장 수불 현황을 요약하는 전문가입니다.\n"
         "아래 현황 수치를 바탕으로 2문장 이내 한국어로 핵심을 요약하세요.\n"
-        "수치는 그대로 사용하고, 추측하지 마세요.\n\n"
+        + (
+            "타사 구매단가 변동이 제공된 경우, "
+            "마지막에 한 줄로 'XX제철 N회 인하/인상이 있었습니다' 형식으로 간결하게 언급하세요.\n"
+            if price_context else ""
+        )
+        + "수치는 그대로 사용하고, 추측하지 마세요.\n\n"
         f"[현황]\n{summary_text}"
+        f"{price_block}"
     )
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=150,
+        max_tokens=200,
         temperature=0.1,
         timeout=15,
     )
@@ -984,10 +1046,7 @@ def _render_subol_tab():
 
     # ── 챗봇 설정 (사이드바) ────────────────────────────────────
     st.sidebar.divider()
-    st.sidebar.header("챗봇 설정")
-    api_key = st.sidebar.text_input(
-        "OpenAI API Key", type="password", key="api_key", placeholder="sk-...",
-    )
+    api_key = os.getenv("OPENAI_API_KEY", "")
 
     # ── 메일 발송 (사이드바) ─────────────────────────────────────
     st.sidebar.divider()
@@ -1404,7 +1463,8 @@ def _render_subol_tab():
                 if st.checkbox("AI 요약 (입고 상세)", key="ai_receipt"):
                     with st.spinner("AI 요약 생성 중..."):
                         try:
-                            st.caption(_ai_summary(_r_summary, api_key))
+                            _price_ctx = _build_price_context()
+                            st.caption(_ai_summary(_r_summary, api_key, price_context=_price_ctx))
                         except Exception as e:
                             st.caption(f"AI 요약 오류: {e}")
 
@@ -1520,7 +1580,7 @@ def _render_subol_tab():
 
         if user_input:
             if not api_key:
-                st.warning("왼쪽 사이드바에서 OpenAI API Key를 입력해 주세요.")
+                st.warning(".env 파일에 OPENAI_API_KEY를 설정해 주세요.")
             else:
                 with st.chat_message("user"):
                     st.markdown(user_input)
